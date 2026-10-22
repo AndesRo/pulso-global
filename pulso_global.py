@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import statistics
 import threading
@@ -594,9 +595,10 @@ def main():
     if args.json:
         print(json.dumps(obtener_snapshot(args.simulado), ensure_ascii=False, indent=2))
         return
-    Handler.simulado = args.simulado
-    srv = ThreadingHTTPServer(("127.0.0.1", args.puerto), Handler)
-    url = f"http://localhost:{args.puerto}"
+        Handler.simulado = args.simulado
+    puerto = int(os.environ.get("PORT", args.puerto))
+    srv = ThreadingHTTPServer(("0.0.0.0", puerto), Handler)
+    url = f"http://localhost:{puerto}"
     print(f"Pulso Global en {url}  ({'SIMULADO' if args.simulado else 'datos reales'})  ·  Ctrl+C para salir")
     print("Tip para grabar: abre", url + "/?tour=1&clean=1")
     if not args.sin_navegador:
