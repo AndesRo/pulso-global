@@ -680,8 +680,8 @@ def diagnostico() -> int:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"),
-                    help="interfaz de escucha (0.0.0.0 para aceptar conexiones externas)")
+    ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"),
+                help="interfaz de escucha (0.0.0.0 para aceptar conexiones externas)")
     ap.add_argument("--puerto", type=int, default=int(os.environ.get("PORT", "8765")))
     ap.add_argument("--log", default=os.environ.get("LOG_LEVEL", "INFO"), help="DEBUG, INFO, WARNING...")
     ap.add_argument("--json", action="store_true", help="imprime un snapshot JSON y termina")
