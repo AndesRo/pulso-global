@@ -3,7 +3,7 @@
 Pulso Global - terminal de indicadores económicos mundiales.
 
 Backend (solo librería estándar) que agrega APIs públicas y gratuitas, calcula
-métricas y alertas, y sirve la interfaz web (index.html) en http://localhost:8765
+métricas y alertas, y sirve la interfaz web (index.html + static/).
 
 Fuentes (sin API key):
   Yahoo Finance (chart)  índices, materias primas, VIX, bono 10Y, DXY, cripto
@@ -11,35 +11,32 @@ Fuentes (sin API key):
   mindicador.cl          Chile: dólar, UF, UTM, TPM, IPC, cobre, desempleo, IMACEC
   Banco Mundial          inflación, crecimiento del PIB y desempleo por país
   alternative.me         índice Fear & Greed (sentimiento cripto)
-
-Uso:
-  python pulso_global.py                 # datos reales + abre el navegador
-  python pulso_global.py --simulado      # datos sintéticos (sin internet)
-  python pulso_global.py --json          # imprime un snapshot y termina
-  python pulso_global.py --diagnostico   # prueba cada API y muestra el error exacto
+Variables de entorno: HOST, PORT, LOG_LEVEL (equivalentes a --host, --puerto, --log).
 """
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
+import logging
 import os
-import random
+import signal
 import statistics
 import threading
 import time
 import urllib.request
-import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
+LOG = logging.getLogger("pulso")
 AQUI = Path(__file__).resolve().parent
 STATIC = AQUI / "static"
 TIPOS = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
-         ".woff2": "font/woff2"}
+         ".woff2": "font/woff2", ".webmanifest": "application/manifest+json"}
 UA = {"User-Agent": "Mozilla/5.0 (compatible; PulsoGlobal/1.0)", "Accept": "application/json"}
 TTL_MERCADO = 60          # segundos que se reutiliza un snapshot
 TTL_MACRO = 6 * 3600      # el Banco Mundial cambia una vez al año
@@ -49,58 +46,58 @@ UMBRAL_PB = 10.0          # puntos base para tasas (bono 10Y)
 
 
 # --------------------------------------------------------------------------
-# Catálogo de instrumentos (base/vol/shock solo se usan en modo simulado)
+# Catálogo de instrumentos
 # --------------------------------------------------------------------------
-def spec(id, sym, name, group, unit, dec, base, vol, **extra):
-    return dict(id=id, sym=sym, name=name, group=group, unit=unit, dec=dec, base=base, vol=vol, **extra)
+def spec(id, sym, name, group, unit, dec, **extra):
+    return dict(id=id, sym=sym, name=name, group=group, unit=unit, dec=dec, **extra)
 
 
 YAHOO = [
-    spec("spx", "^GSPC", "S&P 500", "indices", "pts", 2, 6700, .0075),
-    spec("ndx", "^IXIC", "Nasdaq Composite", "indices", "pts", 2, 22800, .010),
-    spec("dji", "^DJI", "Dow Jones", "indices", "pts", 2, 46500, .007),
-    spec("sx5e", "^STOXX50E", "Euro Stoxx 50", "indices", "pts", 2, 5600, .008),
-    spec("ftse", "^FTSE", "FTSE 100", "indices", "pts", 2, 9500, .006),
-    spec("n225", "^N225", "Nikkei 225", "indices", "pts", 2, 48000, .011),
-    spec("hsi", "^HSI", "Hang Seng", "indices", "pts", 2, 26000, .011),
-    spec("bvsp", "^BVSP", "Bovespa", "indices", "pts", 0, 145000, .008),
-    spec("ipsa", "^IPSA", "IPSA (Chile)", "indices", "pts", 2, 9500, .007),
-    spec("vix", "^VIX", "VIX · volatilidad", "riesgo", "pts", 2, 16, .045, shock=.12),
-    spec("tnx", "^TNX", "Bono EE.UU. 10 años", "riesgo", "%", 3, 4.1, .010, rate=True),
-    spec("dxy", "DX-Y.NYB", "Índice dólar (DXY)", "riesgo", "pts", 2, 99, .003),
-    spec("gold", "GC=F", "Oro", "commodities", "USD/oz", 2, 4100, .009, drift=.0016),
-    spec("silver", "SI=F", "Plata", "commodities", "USD/oz", 2, 48, .016),
-    spec("wti", "CL=F", "Petróleo WTI", "commodities", "USD/bbl", 2, 62, .018, shock=.042),
-    spec("brent", "BZ=F", "Petróleo Brent", "commodities", "USD/bbl", 2, 66, .017),
-    spec("copper", "HG=F", "Cobre", "commodities", "USD/lb", 3, 5.0, .011),
-    spec("gas", "NG=F", "Gas natural", "commodities", "USD/MMBtu", 3, 3.2, .028),
-    spec("btc", "BTC-USD", "Bitcoin", "cripto", "USD", 2, 98000, .022, shock=-.065),
-    spec("eth", "ETH-USD", "Ethereum", "cripto", "USD", 2, 3500, .028),
-    spec("sol", "SOL-USD", "Solana", "cripto", "USD", 2, 170, .038),
+    spec("spx", "^GSPC", "S&P 500", "indices", "pts", 2),
+    spec("ndx", "^IXIC", "Nasdaq Composite", "indices", "pts", 2),
+    spec("dji", "^DJI", "Dow Jones", "indices", "pts", 2),
+    spec("sx5e", "^STOXX50E", "Euro Stoxx 50", "indices", "pts", 2),
+    spec("ftse", "^FTSE", "FTSE 100", "indices", "pts", 2),
+    spec("n225", "^N225", "Nikkei 225", "indices", "pts", 2),
+    spec("hsi", "^HSI", "Hang Seng", "indices", "pts", 2),
+    spec("bvsp", "^BVSP", "Bovespa", "indices", "pts", 0),
+    spec("ipsa", "^IPSA", "IPSA (Chile)", "indices", "pts", 2),
+    spec("vix", "^VIX", "VIX · volatilidad", "riesgo", "pts", 2),
+    spec("tnx", "^TNX", "Bono EE.UU. 10 años", "riesgo", "%", 3, rate=True),
+    spec("dxy", "DX-Y.NYB", "Índice dólar (DXY)", "riesgo", "pts", 2),
+    spec("gold", "GC=F", "Oro", "commodities", "USD/oz", 2),
+    spec("silver", "SI=F", "Plata", "commodities", "USD/oz", 2),
+    spec("wti", "CL=F", "Petróleo WTI", "commodities", "USD/bbl", 2),
+    spec("brent", "BZ=F", "Petróleo Brent", "commodities", "USD/bbl", 2),
+    spec("copper", "HG=F", "Cobre", "commodities", "USD/lb", 3),
+    spec("gas", "NG=F", "Gas natural", "commodities", "USD/MMBtu", 3),
+    spec("btc", "BTC-USD", "Bitcoin", "cripto", "USD", 2),
+    spec("eth", "ETH-USD", "Ethereum", "cripto", "USD", 2),
+    spec("sol", "SOL-USD", "Solana", "cripto", "USD", 2),
 ]
 
 FX = [
-    spec("eurusd", "EUR/USD", "Euro / Dólar", "fx", "USD", 4, 1.16, .0035, ccy="EUR", inv=True),
-    spec("gbpusd", "GBP/USD", "Libra / Dólar", "fx", "USD", 4, 1.33, .0040, ccy="GBP", inv=True),
-    spec("usdjpy", "USD/JPY", "Dólar / Yen", "fx", "JPY", 2, 150, .0050, ccy="JPY"),
-    spec("usdcny", "USD/CNY", "Dólar / Yuan", "fx", "CNY", 4, 7.1, .0012, ccy="CNY"),
-    spec("usdbrl", "USD/BRL", "Dólar / Real", "fx", "BRL", 4, 5.4, .0060, ccy="BRL"),
-    spec("usdmxn", "USD/MXN", "Dólar / Peso mexicano", "fx", "MXN", 4, 18.5, .0060, ccy="MXN"),
-    spec("usdchf", "USD/CHF", "Dólar / Franco suizo", "fx", "CHF", 4, .80, .0040, ccy="CHF"),
+    spec("eurusd", "EUR/USD", "Euro / Dólar", "fx", "USD", 4, ccy="EUR", inv=True),
+    spec("gbpusd", "GBP/USD", "Libra / Dólar", "fx", "USD", 4, ccy="GBP", inv=True),
+    spec("usdjpy", "USD/JPY", "Dólar / Yen", "fx", "JPY", 2, ccy="JPY"),
+    spec("usdcny", "USD/CNY", "Dólar / Yuan", "fx", "CNY", 4, ccy="CNY"),
+    spec("usdbrl", "USD/BRL", "Dólar / Real", "fx", "BRL", 4, ccy="BRL"),
+    spec("usdmxn", "USD/MXN", "Dólar / Peso mexicano", "fx", "MXN", 4, ccy="MXN"),
+    spec("usdchf", "USD/CHF", "Dólar / Franco suizo", "fx", "CHF", 4, ccy="CHF"),
 ]
 
 CHILE_SERIES = [
-    spec("usdclp", "USD/CLP", "Dólar observado", "chile", "CLP", 2, 950, .005, codigo="dolar", shock=.016),
-    spec("uf", "UF", "Unidad de Fomento", "chile", "CLP", 2, 40700, .00002, codigo="uf", drift=.00009, sinextremos=True),
-    spec("cobre", "Cu", "Cobre (Cochilco)", "chile", "USD/lb", 3, 5.0, .008, codigo="libra_cobre"),
+    spec("usdclp", "USD/CLP", "Dólar observado", "chile", "CLP", 2, codigo="dolar"),
+    spec("uf", "UF", "Unidad de Fomento", "chile", "CLP", 2, codigo="uf", sinextremos=True),
+    spec("cobre", "Cu", "Cobre (Cochilco)", "chile", "USD/lb", 3, codigo="libra_cobre"),
 ]
-# (clave en mindicador, nombre, unidad, decimales, valor simulado)
+# (clave en mindicador, nombre, unidad, decimales)
 CHILE_STATS = [
-    ("tpm", "Tasa de política monetaria", "%", 2, 4.50),
-    ("ipc", "IPC · variación mensual", "%", 2, 0.30),
-    ("tasa_desempleo", "Desempleo", "%", 1, 8.7),
-    ("imacec", "IMACEC · variación anual", "%", 1, 2.4),
-    ("utm", "UTM", "CLP", 0, 69500),
+    ("tpm", "Tasa de política monetaria", "%", 2),
+    ("ipc", "IPC · variación mensual", "%", 2),
+    ("tasa_desempleo", "Desempleo", "%", 1),
+    ("imacec", "IMACEC · variación anual", "%", 1),
+    ("utm", "UTM", "CLP", 0),
 ]
 
 PAISES = {"USA": "EE.UU.", "CHN": "China", "DEU": "Alemania", "JPN": "Japón", "GBR": "Reino Unido",
@@ -108,11 +105,6 @@ PAISES = {"USA": "EE.UU.", "CHN": "China", "DEU": "Alemania", "JPN": "Japón", "
 MACRO = {"inflacion": ("FP.CPI.TOTL.ZG", "Inflación anual"),
          "pib": ("NY.GDP.MKTP.KD.ZG", "Crecimiento del PIB"),
          "desempleo": ("SL.UEM.TOTL.ZS", "Desempleo")}
-MACRO_SIM = {
-    "inflacion": {"USA": 2.9, "CHN": 0.2, "DEU": 2.5, "JPN": 2.7, "GBR": 2.5, "IND": 4.9, "BRA": 4.4, "MEX": 4.7, "CHL": 3.9, "ESP": 2.9},
-    "pib": {"USA": 2.8, "CHN": 5.0, "DEU": -0.2, "JPN": 0.1, "GBR": 1.1, "IND": 6.5, "BRA": 3.4, "MEX": 1.2, "CHL": 2.6, "ESP": 3.2},
-    "desempleo": {"USA": 4.0, "CHN": 5.0, "DEU": 3.4, "JPN": 2.6, "GBR": 4.3, "IND": 4.2, "BRA": 7.0, "MEX": 2.7, "CHL": 8.5, "ESP": 11.4},
-}
 
 
 # --------------------------------------------------------------------------
@@ -120,14 +112,15 @@ MACRO_SIM = {
 # --------------------------------------------------------------------------
 def http_json(url: str, timeout: int = 12, reintentos: int = 1):
     ultimo: Exception | None = None
-    for _ in range(reintentos + 1):
+    for intento in range(reintentos + 1):
         try:
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.load(r)
         except Exception as e:  # red, HTTP o JSON inválido
             ultimo = e
-            time.sleep(0.5)
+            if intento < reintentos:
+                time.sleep(0.5)
     raise ultimo or RuntimeError("no se realizó ningún intento")
 
 
@@ -260,40 +253,11 @@ def parse_fng(payload: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Modo simulado
-# --------------------------------------------------------------------------
-def fechas_habiles(n: int, todos: bool = False) -> list[str]:
-    out, d = [], date.today()
-    while len(out) < n:
-        if todos or d.weekday() < 5:
-            out.append(d.isoformat())
-        d -= timedelta(days=1)
-    return out[::-1]
-
-
-def sim_serie(s: dict, n: int = 65, todos: bool = False):
-    rng = random.Random(s["id"])
-    v, vals = s["base"], []
-    for _ in range(n):
-        v *= 1 + s.get("drift", 0.0) + rng.gauss(0, s["vol"])
-        vals.append(v)
-    vals[-1] *= 1 + s.get("shock", 0.0)
-    return fechas_habiles(n, todos), vals
-
-
-def sim_item(s: dict) -> dict:
-    fechas, vals = sim_serie(s, 90 if s["group"] == "cripto" else 65, s["group"] == "cripto")
-    return construir_item(s, fechas, vals, "Simulado")
-
-
-# --------------------------------------------------------------------------
 # Fuentes: cada una devuelve (datos, estado)
 # --------------------------------------------------------------------------
-def fuente_yahoo(sim: bool):
+def fuente_yahoo():
     def uno(s):
         try:
-            if sim:
-                return sim_item(s)
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(s['sym'])}?range=3mo&interval=1d"
             fechas, vals = parse_yahoo(http_json(url))
             return construir_item(s, fechas, vals, "Yahoo Finance")
@@ -310,14 +274,8 @@ def fuente_yahoo(sim: bool):
     return items, estado
 
 
-def fuente_frankfurter(sim: bool):
+def fuente_frankfurter():
     items, per_usd = [], {"USD": 1.0}
-    if sim:
-        for s in FX:
-            fechas, vals = sim_serie(s)
-            items.append(construir_item(s, fechas, vals, "Simulado"))
-            per_usd[s["ccy"]] = 1 / vals[-1] if s.get("inv") else vals[-1]
-        return (items, per_usd), {"estado": "ok", "n": len(items)}
     hoy = date.today()
     syms = ",".join(s["ccy"] for s in FX)
     url = f"https://api.frankfurter.dev/v1/{hoy - timedelta(days=95)}..{hoy}?base=USD&symbols={syms}"
@@ -332,16 +290,30 @@ def fuente_frankfurter(sim: bool):
 
 
 MINDICADOR_HOSTS = ("https://mindicador.cl", "https://www.mindicador.cl")
+TIMEOUT_CHILE = 6            # segundos por petición
+PRESUPUESTO_CHILE = 14       # segundos máximos por actualización completa de Chile
+TTL_CHILE = 15 * 60          # los datos son diarios: no se piden cada minuto
+REINTENTO_CHILE = 2 * 60     # espera antes de reintentar algo que acaba de fallar
+EDAD_MAX_DISCO = 3 * 86400   # datos guardados en disco más viejos que esto se ignoran
+ESPERA_REINTENTO = 1.0       # pausa entre reintentos de una misma petición
+PAUSA_CHILE = 0.3            # pausa entre peticiones (no saturar al servidor)
+CACHE_CHILE = AQUI / "cache" / "chile.json"
 
 
-def mindicador_json(ruta: str):
-    """mindicador.cl a veces es lento o rechaza peticiones: prueba ambos hosts."""
+def mindicador_json(ruta: str, hasta: float | None = None):
+    """mindicador.cl es lento e inestable: prueba ambos hosts (y uno más de nuevo),
+    con pausa entre intentos y respetando el tiempo máximo `hasta`."""
     ultimo: Exception | None = None
-    for host in MINDICADOR_HOSTS:
+    hosts = (*MINDICADOR_HOSTS, MINDICADOR_HOSTS[0])
+    for n, host in enumerate(hosts):
+        if hasta is not None and time.time() > hasta:
+            raise ultimo or TimeoutError("tiempo máximo agotado")
         try:
-            return http_json(host + ruta, timeout=15, reintentos=0)
+            return http_json(host + ruta, timeout=TIMEOUT_CHILE, reintentos=0)
         except Exception as e:
             ultimo = e
+            if n < len(hosts) - 1:
+                time.sleep(ESPERA_REINTENTO)
     raise ultimo or RuntimeError("no se realizó ningún intento")
 
 
@@ -349,95 +321,138 @@ def _err(e: Exception) -> str:
     return f"{type(e).__name__}: {e}"[:140]
 
 
-def fuente_mindicador(sim: bool):
-    items = []
-    if sim:
-        for s in CHILE_SERIES:
-            fechas, vals = sim_serie(s)
-            items.append(construir_item(s, fechas, vals, "Simulado"))
-        hoy = date.today().isoformat()
-        for clave, nombre, unidad, dec, v in CHILE_STATS:
-            items.append(construir_stat(clave, nombre, unidad, dec, v, hoy, "Simulado"))
-        return items, {"estado": "ok", "n": len(items)}
-    anio = date.today().year
+def _hace(seg: float) -> str:
+    m = int(seg // 60)
+    return f"{m} min" if m < 90 else (f"{m // 60} h" if m < 2880 else f"{m // 1440} días")
 
-    def serie(s):
+
+# Caché de Chile: clave -> (momento, dato); y fallos recientes: clave -> (momento, mensaje)
+_chile: dict = {"datos": {}, "fallos": {}, "disco": False}
+_chile_lock = threading.Lock()
+
+
+def reiniciar_chile():
+    _chile.update(datos={}, fallos={}, disco=False)
+
+
+def _cargar_disco():
+    if _chile["disco"]:
+        return
+    _chile["disco"] = True
+    try:
+        crudo = json.loads(CACHE_CHILE.read_text(encoding="utf-8"))
+        ahora = time.time()
+        for clave, (ts, dato) in crudo.items():
+            if ahora - ts < EDAD_MAX_DISCO and clave not in _chile["datos"]:
+                _chile["datos"][clave] = (ts, dato)
+    except Exception:
+        pass   # sin caché o archivo dañado: se ignora
+
+
+def _guardar_disco():
+    try:
+        CACHE_CHILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_CHILE.write_text(json.dumps({k: list(v) for k, v in _chile["datos"].items()},
+                                          ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _chile_obtener(clave: str, descargar, hasta: float):
+    """Devuelve (dato, error, momento_del_dato). Usa la caché mientras sea reciente;
+    si hay que pedirlo y falla, devuelve el último dato bueno junto con el error."""
+    ahora = time.time()
+    previo = _chile["datos"].get(clave)
+    if previo and ahora - previo[0] < TTL_CHILE:
+        return previo[1], None, previo[0]
+    fallo = _chile["fallos"].get(clave)
+    if not fallo or ahora - fallo[0] >= REINTENTO_CHILE:
         try:
-            fechas, vals = parse_mindicador_serie(mindicador_json(f"/api/{s['codigo']}/{anio}"))
-            if len(vals) < 45:   # inicio de año: completar con el anterior
-                f0, v0 = parse_mindicador_serie(mindicador_json(f"/api/{s['codigo']}/{anio - 1}"))
-                fechas, vals = (f0 + fechas)[-95:], (v0 + vals)[-95:]
-            return construir_item(s, fechas, vals, "mindicador.cl")
+            dato = descargar(hasta)
         except Exception as e:
-            return e
-
-    def estadisticas():
-        try:
-            snap = mindicador_json("/api")
-            out = []
-            for clave, nombre, unidad, dec, _ in CHILE_STATS:
-                d = snap.get(clave)
-                if d and d.get("valor") is not None:
-                    out.append(construir_stat(clave, nombre, unidad, dec, float(d["valor"]), d["fecha"][:10], "mindicador.cl"))
-            return out
-        except Exception as e:
-            return e
-
-    with ThreadPoolExecutor(4) as ex:
-        futs = [ex.submit(serie, s) for s in CHILE_SERIES]
-        fut_st = ex.submit(estadisticas)
-        res, stats = [f.result() for f in futs], fut_st.result()
-
-    errores = []
-    for s, r in zip(CHILE_SERIES, res):
-        if isinstance(r, dict):
-            items.append(r)
+            fallo = _chile["fallos"][clave] = (ahora, _err(e))
         else:
-            errores.append(f"{s['name']}: {_err(r)}")
-    if isinstance(stats, list):
-        items += stats
-    else:
-        errores.append(f"Indicadores macro: {_err(stats)}")
+            _chile["datos"][clave] = (time.time(), dato)
+            _chile["fallos"].pop(clave, None)
+            _guardar_disco()
+            time.sleep(PAUSA_CHILE)
+            return dato, None, time.time()
+    return (previo[1] if previo else None), fallo[1], (previo[0] if previo else 0.0)
 
-    if not any(i["id"] == "usdclp" for i in items):   # respaldo del dólar vía Yahoo Finance
+
+def _descargar_serie(s: dict, anio: int):
+    def f(hasta):
+        fechas, vals = parse_mindicador_serie(mindicador_json(f"/api/{s['codigo']}/{anio}", hasta))
+        if len(vals) < 45:   # inicio de año: completar con el anterior
+            f0, v0 = parse_mindicador_serie(mindicador_json(f"/api/{s['codigo']}/{anio - 1}", hasta))
+            fechas, vals = (f0 + fechas)[-95:], (v0 + vals)[-95:]
+        return construir_item(s, fechas, vals, "mindicador.cl")
+    return f
+
+
+def _descargar_estadisticas(hasta):
+    snap = mindicador_json("/api", hasta)
+    out = []
+    for clave, nombre, unidad, dec in CHILE_STATS:
+        d = snap.get(clave)
+        if isinstance(d, dict) and d.get("valor") is not None:
+            out.append(construir_stat(clave, nombre, unidad, dec, float(d["valor"]), d["fecha"][:10], "mindicador.cl"))
+    if not out:
+        raise ValueError("la respuesta no trae indicadores")
+    return out
+
+
+def fuente_mindicador():
+    items = []
+    errores: list[str] = []
+    obsoletos: list[str] = []
+    with _chile_lock:
+        _cargar_disco()
+        hasta = time.time() + PRESUPUESTO_CHILE
+        anio = date.today().year
+        # Primero lo que no tiene respaldo (indicadores macro), después las series
+        pedidos = [("Indicadores macro", "stats", _descargar_estadisticas)] + \
+                  [(s["name"], s["id"], _descargar_serie(s, anio)) for s in CHILE_SERIES]
+        for nombre, clave, descargar in pedidos:
+            dato, error, momento = _chile_obtener(clave, descargar, hasta)
+            if error:
+                errores.append(f"{nombre}: {error}")
+                if dato is not None:
+                    obsoletos.append(f"{nombre} (hace {_hace(time.time() - momento)})")
+            if dato is None:
+                continue
+            items += dato if isinstance(dato, list) else [dato]
+
+    dolar = CHILE_SERIES[0]
+    dolar_viejo = any(o.startswith(dolar["name"]) for o in obsoletos)
+    if dolar_viejo or not any(i["id"] == "usdclp" for i in items):   # respaldo del dólar vía Yahoo Finance
         try:
             f, v = parse_yahoo(http_json("https://query1.finance.yahoo.com/v8/finance/chart/CLP%3DX?range=3mo&interval=1d"))
-            items.insert(0, construir_item(CHILE_SERIES[0], f, v, "Yahoo Finance (respaldo)"))
+            items = [i for i in items if i["id"] != "usdclp"]
+            items.insert(0, construir_item(dolar, f, v, "Yahoo Finance (respaldo)"))
+            obsoletos = [o for o in obsoletos if not o.startswith(dolar["name"])]
         except Exception as e:
             errores.append(f"Respaldo del dólar: {_err(e)}")
 
-    if errores:   # completar con los últimos datos buenos lo que no llegó ahora
-        presentes = {i["id"] for i in items}
-        previos = [i for i in (_ultimo_ok.get(("mindicador", False)) or []) if i["id"] not in presentes]
-        items += previos
-        if previos:
-            errores.append("se muestran datos anteriores de: " + ", ".join(i["name"] for i in previos))
+    if obsoletos:
+        errores.append("se muestran datos anteriores de: " + ", ".join(obsoletos))
     if not items:
         raise RuntimeError(" | ".join(errores) or "sin datos")
+    items.sort(key=lambda i: i["kind"] != "serie")   # series primero, indicadores macro después
     estado = {"estado": "parcial" if errores else "ok", "n": len(items)}
     if errores:
-        estado["error"] = " | ".join(errores)[:400]
+        estado["error"] = " | ".join(errores)[:500]
     return items, estado
 
 
-def fuente_fng(sim: bool):
-    if sim:
-        rng, v, hist = random.Random("fng"), 55.0, []
-        for _ in range(30):
-            v = min(95, max(5, v + rng.gauss(0, 4)))
-            hist.append(int(v))
-        return {"value": 72, "label": "Greed", "history": hist[:-1] + [72],
-                "dates": fechas_habiles(30, True)}, {"estado": "ok", "n": 1}
+def fuente_fng():
     return parse_fng(http_json("https://api.alternative.me/fng/?limit=30")), {"estado": "ok", "n": 1}
 
 
 _macro_cache = {"ts": 0.0, "data": None}
 
 
-def fuente_macro(sim: bool):
-    if sim:
-        return {k: sorted([{"iso": i, "pais": PAISES[i], "valor": v, "anio": 2024} for i, v in d.items()],
-                          key=lambda x: -x["valor"]) for k, d in MACRO_SIM.items()}, {"estado": "ok", "n": 3}
+def fuente_macro():
     if _macro_cache["data"] and time.time() - _macro_cache["ts"] < TTL_MACRO:
         return _macro_cache["data"], {"estado": "ok", "n": 3}
     paises = ";".join(PAISES)
@@ -452,18 +467,19 @@ def fuente_macro(sim: bool):
 _ultimo_ok: dict = {}   # último resultado bueno de cada fuente (para no dejar la interfaz vacía)
 
 
-def ejecutar(nombre: str, fn, sim: bool, fuentes: dict):
+def ejecutar(nombre: str, fn, fuentes: dict):
     try:
-        datos, estado = fn(sim)
+        datos, estado = fn()
     except Exception as e:
-        previo = _ultimo_ok.get((nombre, sim))
+        LOG.warning("fuente %s: %s", nombre, _err(e))
+        previo = _ultimo_ok.get(nombre)
         if previo is not None:
             fuentes[nombre] = {"estado": "parcial", "obsoleto": True,
                                "error": f"{_err(e)} · mostrando los últimos datos recibidos"}
             return previo
         fuentes[nombre] = {"estado": "error", "error": _err(e)}
         return None
-    _ultimo_ok[(nombre, sim)] = datos
+    _ultimo_ok[nombre] = datos
     fuentes[nombre] = estado
     return datos
 
@@ -471,12 +487,12 @@ def ejecutar(nombre: str, fn, sim: bool, fuentes: dict):
 # --------------------------------------------------------------------------
 # Snapshot + caché
 # --------------------------------------------------------------------------
-def construir_snapshot(sim: bool = False) -> dict:
+def construir_snapshot() -> dict:
     fuentes: dict = {}
     tareas = {"yahoo": fuente_yahoo, "frankfurter": fuente_frankfurter, "mindicador": fuente_mindicador,
               "alternativeme": fuente_fng, "bancomundial": fuente_macro}
     with ThreadPoolExecutor(5) as ex:
-        futs = {k: ex.submit(ejecutar, k, fn, sim, fuentes) for k, fn in tareas.items()}
+        futs = {k: ex.submit(ejecutar, k, fn, fuentes) for k, fn in tareas.items()}
         res = {k: f.result() for k, f in futs.items()}
     items = list(res["yahoo"] or [])
     per_usd = {"USD": 1.0}
@@ -490,68 +506,149 @@ def construir_snapshot(sim: bool = False) -> dict:
         per_usd["CLP"] = clp
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "mode": "simulado" if sim else "live",
         "fuentes": fuentes, "items": items, "fx_per_usd": per_usd,
         "feargreed": res["alternativeme"], "macro": res["bancomundial"],
         "ttl": TTL_MERCADO,
     }
 
 
-_cache = {"ts": 0.0, "data": None, "sim": None}
-_lock = threading.Lock()
+_cache: dict = {"ts": 0.0, "data": None}
+_build = threading.Lock()      # solo una actualización a la vez
 
 
-def obtener_snapshot(sim: bool = False) -> dict:
-    with _lock:
-        ahora = time.time()
-        if _cache["data"] and _cache["sim"] == sim and ahora - _cache["ts"] < TTL_MERCADO:
-            return _cache["data"]
-        data = construir_snapshot(sim)
+def _refrescar() -> dict:
+    with _build:
+        if _cache["data"] and time.time() - _cache["ts"] < TTL_MERCADO:
+            return _cache["data"]            # otro hilo ya lo actualizó
+        data = construir_snapshot()
         if all(f["estado"] == "error" for f in data["fuentes"].values()) and _cache["data"]:
             return {**_cache["data"], "stale": True}
-        _cache.update(ts=ahora, data=data, sim=sim)
+        _cache.update(ts=time.time(), data=data)
         return data
+
+
+def obtener_snapshot() -> dict:
+    """Datos frescos si los hay; si expiraron, devuelve los anteriores al instante y
+    actualiza en segundo plano (así ningún visitante espera a las APIs, salvo el primero)."""
+    data = _cache["data"]
+    if data and time.time() - _cache["ts"] < TTL_MERCADO:
+        return data
+    if data:
+        if not _build.locked():
+            threading.Thread(target=_refrescar, daemon=True, name="refresco").start()
+        return data
+    return _refrescar()
 
 
 # --------------------------------------------------------------------------
 # Servidor
 # --------------------------------------------------------------------------
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; "
+       "font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+CABECERAS_SEGURIDAD = {
+    "Content-Security-Policy": CSP,
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+}
+COMPRIMIBLES = {"text/html", "text/css", "text/javascript", "application/json", "image/svg+xml"}
+
+
 class Handler(BaseHTTPRequestHandler):
-    simulado = False
+    server_version = "PulsoGlobal"
+    sys_version = ""
 
-    def _send(self, code: int, body: bytes, ctype: str):
+    def version_string(self):
+        return self.server_version
+    protocol_version = "HTTP/1.1"
+    timeout = 30                      # corta conexiones inactivas
+
+    # -- respuesta genérica (gzip, cabeceras de seguridad, ETag, HEAD) --
+    def _send(self, code: int, body: bytes, ctype: str, cache: str = "no-store",
+              etag: str | None = None, head: bool = False):
+        if etag and self.headers.get("If-None-Match") == etag:
+            code, body = 304, b""
+        codificacion = None
+        if code == 200 and len(body) > 512 and ctype.split(";")[0] in COMPRIMIBLES \
+                and "gzip" in self.headers.get("Accept-Encoding", ""):
+            body, codificacion = gzip.compress(body, 5), "gzip"
         self.send_response(code)
-        self.send_header("Content-Type", ctype)
+        if code != 304:
+            self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
+        self.send_header("Vary", "Accept-Encoding")
+        if codificacion:
+            self.send_header("Content-Encoding", codificacion)
+        if etag:
+            self.send_header("ETag", etag)
+        for k, v in CABECERAS_SEGURIDAD.items():
+            self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if not head:
+            self.wfile.write(body)
 
-    def _static(self, rel: str):
+    def _json(self, code: int, obj, head: bool = False, cache: str = "no-store"):
+        body = json.dumps(obj, ensure_ascii=False, allow_nan=False).encode()
+        self._send(code, body, "application/json; charset=utf-8", cache=cache, head=head)
+
+    def _archivo(self, archivo: Path, tipo: str, head: bool):
+        st = archivo.stat()
+        etag = f'W/"{st.st_size:x}-{st.st_mtime_ns:x}"'
+        self._send(200, archivo.read_bytes(), tipo, cache="no-cache", etag=etag, head=head)
+
+    def _static(self, rel: str, head: bool):
         """Sirve archivos de /static sin permitir salir de esa carpeta (../)."""
         base = STATIC.resolve()
         archivo = (base / unquote(rel)).resolve()
         tipo = TIPOS.get(archivo.suffix.lower())
         if base not in archivo.parents or not archivo.is_file() or not tipo:
-            return self._send(404, b"No encontrado", "text/plain; charset=utf-8")
-        self._send(200, archivo.read_bytes(), tipo)
+            return self._send(404, b"No encontrado", "text/plain; charset=utf-8", head=head)
+        self._archivo(archivo, tipo, head)
+
+    def _manejar(self, head: bool = False):
+        try:
+            ruta = urlparse(self.path).path
+            if ruta in ("/", "/index.html"):
+                self._archivo(AQUI / "index.html", "text/html; charset=utf-8", head)
+            elif ruta.startswith("/static/"):
+                self._static(ruta[len("/static/"):], head)
+            elif ruta == "/api/snapshot":
+                try:
+                    datos = obtener_snapshot()
+                except Exception:
+                    LOG.exception("no se pudo construir el snapshot")
+                    return self._json(503, {"error": "datos no disponibles por ahora"}, head)
+                self._json(200, datos, head, cache="public, max-age=20")
+            elif ruta in ("/api/health", "/healthz"):
+                edad = round(time.time() - _cache["ts"]) if _cache["data"] else None
+                self._json(200, {"ok": True, "snapshot_edad_s": edad}, head)
+            else:
+                self._send(404, b"No encontrado", "text/plain; charset=utf-8", head=head)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass                       # el cliente cerró la conexión
+        except Exception:
+            LOG.exception("error atendiendo %s", self.path)
+            try:
+                self._json(500, {"error": "error interno"}, head)
+            except Exception:
+                pass
 
     def do_GET(self):
-        ruta = urlparse(self.path).path
-        if ruta in ("/", "/index.html"):
-            self._send(200, (AQUI / "index.html").read_bytes(), "text/html; charset=utf-8")
-        elif ruta.startswith("/static/"):
-            self._static(ruta[len("/static/"):])
-        elif ruta == "/api/snapshot":
-            body = json.dumps(obtener_snapshot(self.simulado), ensure_ascii=False, allow_nan=False).encode()
-            self._send(200, body, "application/json; charset=utf-8")
-        elif ruta == "/api/health":
-            self._send(200, b'{"ok":true}', "application/json")
-        else:
-            self._send(404, b"No encontrado", "text/plain; charset=utf-8")
+        self._manejar()
 
-    def log_message(self, *args):
-        pass
+    def do_HEAD(self):
+        self._manejar(head=True)
+
+    def log_message(self, fmt, *args):
+        LOG.info("%s %s", self.address_string(), fmt % args)
+
+
+class Servidor(ThreadingHTTPServer):
+    request_queue_size = 64
+    daemon_threads = True
 
 
 def diagnostico() -> int:
@@ -583,30 +680,32 @@ def diagnostico() -> int:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--diagnostico", action="store_true", help="prueba cada API por separado y muestra el error exacto")
-    ap.add_argument("--puerto", type=int, default=8765)
-    ap.add_argument("--simulado", action="store_true", help="datos sintéticos (demo sin internet)")
+    ap.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"),
+                    help="interfaz de escucha (0.0.0.0 para aceptar conexiones externas)")
+    ap.add_argument("--puerto", type=int, default=int(os.environ.get("PORT", "8765")))
+    ap.add_argument("--log", default=os.environ.get("LOG_LEVEL", "INFO"), help="DEBUG, INFO, WARNING...")
     ap.add_argument("--json", action="store_true", help="imprime un snapshot JSON y termina")
-    ap.add_argument("--sin-navegador", action="store_true")
+    ap.add_argument("--diagnostico", action="store_true", help="prueba cada API por separado y muestra el error exacto")
     args = ap.parse_args()
 
+    logging.basicConfig(level=args.log.upper(), format="%(asctime)s %(levelname)s %(message)s")
     if args.diagnostico:
         raise SystemExit(diagnostico())
     if args.json:
-        print(json.dumps(obtener_snapshot(args.simulado), ensure_ascii=False, indent=2))
+        print(json.dumps(obtener_snapshot(), ensure_ascii=False, indent=2))
         return
-        Handler.simulado = args.simulado
-    puerto = int(os.environ.get("PORT", args.puerto))
-    srv = ThreadingHTTPServer(("0.0.0.0", puerto), Handler)
-    url = f"http://localhost:{puerto}"
-    print(f"Pulso Global en {url}  ({'SIMULADO' if args.simulado else 'datos reales'})  ·  Ctrl+C para salir")
-    print("Tip para grabar: abre", url + "/?tour=1&clean=1")
-    if not args.sin_navegador:
-        threading.Timer(0.8, webbrowser.open, args=[url]).start()
+
+    srv = Servidor((args.host, args.puerto), Handler)
+    LOG.info("Pulso Global escuchando en http://%s:%d", args.host, args.puerto)
+    threading.Thread(target=_refrescar, daemon=True, name="precarga").start()   # primer snapshot sin esperar visitas
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=srv.shutdown, daemon=True).start())
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nHasta luego")
+        pass
+    finally:
+        LOG.info("cerrando servidor")
+        srv.server_close()
 
 
 if __name__ == "__main__":
